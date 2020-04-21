@@ -1,15 +1,19 @@
 package org.thp.thehive.connector.cortex.services
 
+import java.util.Date
+
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration._
-
 import play.api.Logger
-
 import akka.actor._
 import akka.pattern.pipe
 import javax.inject.Inject
+import org.thp.client.ApplicationError
 import org.thp.cortex.dto.v0.{JobStatus, JobType, OutputJob => CortexJob}
 import org.thp.scalligraph.auth.AuthContext
+import play.api.libs.json.Json
+
+import scala.util.Try
 
 object CortexActor {
   final case class CheckJob(
@@ -60,7 +64,13 @@ class CortexActor @Inject() (connector: Connector, jobSrv: JobSrv, actionSrv: Ac
               .clients
               .find(_.name == cortexId)
               .fold(logger.error(s"Receive a CheckJob for an unknown cortexId: $cortexId")) { client =>
-                client.getReport(cortexJobId, 1.second).pipeTo(self)
+                client
+                  .getReport(cortexJobId, 1.second)
+                  .recover { // this is a workaround for a timeout bug in Cortex
+                    case ApplicationError(500, body) if (body \ "type").asOpt[String].contains("akka.pattern.AskTimeoutException") =>
+                      CortexJob(cortexJobId, "", "", "", new Date, None, None, JobStatus.InProgress, None, None, "", "", None, JobType.analyzer)
+                  }
+                  .pipeTo(self)
                 ()
               }
         }
@@ -84,6 +94,9 @@ class CortexActor @Inject() (connector: Connector, jobSrv: JobSrv, actionSrv: Ac
           logger.error(s"CortexActor received job output $cortexJob but did not have it in state $checkedJobs")
       }
     case cortexJob: CortexJob if cortexJob.status == JobStatus.InProgress || cortexJob.status == JobStatus.Waiting =>
+      logger.info(s"CortexActor received ${cortexJob.status} from client, retrying in ${connector.refreshDelay}")
+
+    case Status.Failure(ApplicationError(500, _)) =>
       logger.info(s"CortexActor received ${cortexJob.status} from client, retrying in ${connector.refreshDelay}")
 
     case _: CortexJob =>
